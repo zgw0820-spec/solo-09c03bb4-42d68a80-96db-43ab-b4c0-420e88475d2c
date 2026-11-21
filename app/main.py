@@ -15,6 +15,8 @@ from .models import (
     ClusterStatus,
     CompletionRequest,
     CompletionResult,
+    ContinuationRequest,
+    ContinuationResult,
     EventView,
     JobSubmitRequest,
     JobView,
@@ -25,14 +27,17 @@ from .scheduler import Event, Job, Scheduler, SchedulerError
 
 app = FastAPI(
     title="MPI 集群回填调度模拟器",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "模拟时钟驱动的 MPI 计算集群回填（backfill）调度。\n\n"
         "- 作业需指定同一机架内的节点数与运行时限；\n"
         "- 队首需要等待时公布最早开工时刻，已公布时刻只可提前；\n"
         "- 队首等待期间，后续作业能用当前空位跑满时限且不耽误预约即可回填；\n"
         "- 完工回报或达到时限释放节点并立即重排；\n"
-        "- 迟到的完工回报不会释放已转配的节点。"
+        "- 迟到的完工回报不会释放已转配的节点；\n"
+        "- 运行中的普通作业可挂一段接续后段（MPI 后处理复用同组节点）：\n"
+        "  受理前按两段跑满时限评估队首预约冲突，受理后前段完工即在当前\n"
+        "  时刻交接开工，前段超时则后段取消。"
     ),
 )
 scheduler = Scheduler(settings)
@@ -60,6 +65,8 @@ def _job_view(job: Job) -> JobView:
         actual_start=job.actual_start,
         finish_time=job.finish_time,
         finish_reason=job.finish_reason,
+        front_id=job.front_id,
+        continuation_id=job.continuation_id,
     )
 
 
@@ -78,12 +85,14 @@ def _cluster_status() -> ClusterStatus:
                for i in scheduler.jobs
                if scheduler.jobs[i].status == "running"]
     queued = [_job_view(scheduler.jobs[i]) for i in scheduler.queue]
+    chained = [_job_view(j) for j in scheduler.chained_continuations()]
     racks = [RackOccupancy(**r) for r in scheduler.rack_occupancy()]
     return ClusterStatus(
         now=scheduler.now,
         racks=racks,
         running_jobs=running,
         queued_jobs=queued,
+        chained_jobs=chained,
         recent_events=[_event_view(e)
                        for e in scheduler.recent_events(limit=20)],
     )
@@ -108,6 +117,21 @@ async def report_completion(job_id: int, payload: CompletionRequest) -> Completi
         return CompletionResult(
             accepted=True,
             job=_job_view(job),
+            events=[_event_view(e) for e in events],
+        )
+
+
+@app.post("/jobs/{job_id}/continuation", response_model=ContinuationResult,
+          status_code=201, tags=["jobs"],
+          summary="为运行中的普通作业提交接续后段（MPI 后处理复用同组节点）")
+async def submit_continuation(job_id: int, payload: ContinuationRequest) -> ContinuationResult:
+    async with _lock:
+        front, cont, events = scheduler.submit_continuation(
+            job_id, payload.duration)
+        return ContinuationResult(
+            accepted=True,
+            front=_job_view(front),
+            continuation=_job_view(cont),
             events=[_event_view(e) for e in events],
         )
 

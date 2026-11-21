@@ -11,6 +11,16 @@ FastAPI 层用一把异步锁保证并发提交不会把同一节点分给两个
    不耽误队首预约（now + duration <= 预约时刻，且不占用预约节点）才放行。
 4. 作业完工回报或达到时限时释放节点并立即重排。
 5. 节点释放带归属校验：迟到的完工回报面对已结束/已转配的节点不会再次释放。
+
+接续（MPI 后处理）规则：
+
+6. 运行中的普通作业可挂一段接续作业（后段），读取前段留在节点本地的临时
+   文件，因此后段复用前段的同一组节点；每个前段最多接一段。
+7. 受理前按两段都跑满时限估算原节点释放时刻；若队首即使换机架也赶不上
+   已公布的预约时刻，拒绝接续，原作业与预约不受影响。
+8. 受理后、前段仍在运行期间，这些节点的预计释放时刻计入后段时限。
+9. 前段的有效完工回报一经受理，后段在当前模拟时刻用这组节点开工。
+10. 前段超时被杀时，后段随之取消，节点释放并重排。
 """
 
 from __future__ import annotations
@@ -22,7 +32,7 @@ from typing import Literal
 
 from .config import Settings
 
-JobStatus = Literal["queued", "running", "finished", "killed"]
+JobStatus = Literal["queued", "running", "finished", "killed", "cancelled"]
 
 
 class SchedulerError(Exception):
@@ -47,6 +57,9 @@ class Job:
     actual_start: int | None = None
     finish_time: int | None = None
     finish_reason: str | None = None
+    # 接续链：后段的 front_id 指向前段；前段的 continuation_id 指向后段
+    front_id: int | None = None
+    continuation_id: int | None = None
 
 
 @dataclass
@@ -99,20 +112,37 @@ class Scheduler:
             raise SchedulerError(404, f"作业 {job_id} 不存在")
         return job
 
-    def _node_free_at(self, rack: str, node: int) -> int:
-        """节点在模拟时间轴上变为空闲的时刻（空闲节点取当前时刻）。"""
+    # 假设性节点释放时刻：(机架, 节点号) -> 释放时刻，用于受理接续前的评估
+    FreeOverrides = dict[tuple[str, int], int]
+
+    def _node_free_at(self, rack: str, node: int,
+                      overrides: FreeOverrides | None = None) -> int:
+        """节点在模拟时间轴上变为空闲的时刻（空闲节点取当前时刻）。
+
+        占用作业若带有已受理、尚未开工的接续后段，则释放时刻把后段时限
+        也计入（两段都跑满时限的最坏估计）。
+        """
+        if overrides is not None and (rack, node) in overrides:
+            return overrides[(rack, node)]
         owner_id = self.owners[rack].get(node)
         if owner_id is None:
             return self.now
         owner = self.jobs[owner_id]
         assert owner.actual_start is not None
-        return owner.actual_start + owner.duration
+        free_at = owner.actual_start + owner.duration
+        if owner.continuation_id is not None:
+            cont = self.jobs[owner.continuation_id]
+            if cont.status == "queued":  # 后段待开工：释放时刻计入后段时限
+                free_at += cont.duration
+        return free_at
 
-    def _earliest_on_rack(self, rack: str, need: int) -> tuple[int, list[int]]:
+    def _earliest_on_rack(self, rack: str, need: int,
+                          overrides: FreeOverrides | None = None,
+                          ) -> tuple[int, list[int]]:
         """某机架上凑齐 need 个节点的最早时刻及对应节点集合。"""
         cap = self.capacities[rack]
         free_at = sorted(
-            (self._node_free_at(rack, n), n) for n in range(cap)
+            (self._node_free_at(rack, n, overrides), n) for n in range(cap)
         )
         chosen = free_at[:need]
         earliest = max(self.now, max(t for t, _ in chosen))
@@ -178,13 +208,19 @@ class Scheduler:
             events.append(self._start(head, rack, nodes, kind))
         return events
 
-    def _earliest_start(self, job: Job) -> tuple[int, str, list[int]]:
-        """跨所有机架求最早开工时刻（队首可换机架）。"""
+    def _earliest_start(self, job: Job,
+                        overrides: FreeOverrides | None = None,
+                        ) -> tuple[int, str, list[int]]:
+        """跨所有机架求最早开工时刻（队首可换机架）。
+
+        ``overrides`` 用于假设性评估（如受理接续前把前段节点释放时刻
+        延后到两段跑满），不修改任何实际状态。
+        """
         candidates: list[tuple[int, int, str, list[int]]] = []
         for idx, rack in enumerate(self.rack_names):
             if self.capacities[rack] < job.nodes:
                 continue
-            earliest, nodes = self._earliest_on_rack(rack, job.nodes)
+            earliest, nodes = self._earliest_on_rack(rack, job.nodes, overrides)
             candidates.append((earliest, idx, rack, nodes))
         if not candidates:
             biggest = max(self.capacities.values())
@@ -271,10 +307,118 @@ class Scheduler:
         events.extend(self.reschedule())
         return job, events
 
+    # ------------------------------------------------------------- 接续（后段）
+
+    def submit_continuation(self, front_id: int, duration: int,
+                            ) -> tuple[Job, Job, list[Event]]:
+        """为运行中的普通作业挂接续后段（MPI 后处理复用同组节点）。
+
+        受理前按两段都跑满时限估算原节点释放时刻；若队首即使换机架也
+        赶不上已公布的预约时刻，拒绝接续，原作业与预约保持不变。
+        返回 (前段, 后段, 事件)。
+        """
+        front = self._job(front_id)
+        if front.front_id is not None:
+            raise SchedulerError(
+                409,
+                f"作业 {front_id} 本身是接续后段（前段 {front.front_id}），"
+                "不能再挂接续",
+            )
+        if front.status != "running":
+            raise SchedulerError(
+                409,
+                f"前段作业 {front_id} 当前状态为 {front.status}，"
+                "仅运行中的普通作业可挂接续",
+            )
+        if front.continuation_id is not None:
+            raise SchedulerError(
+                409,
+                f"前段作业 {front_id} 已有接续后段 {front.continuation_id}，"
+                "每个前段最多接一段",
+            )
+        assert front.actual_start is not None and front.rack is not None
+
+        # 预约冲突评估：两段都跑满时限时原节点的释放时刻
+        extended = front.actual_start + front.duration + duration
+        if self.queue:
+            head = self.jobs[self.queue[0]]
+            if head.scheduled_start is not None:
+                overrides: Scheduler.FreeOverrides = {
+                    (front.rack, n): extended for n in front.assigned_nodes
+                }
+                earliest, _, _ = self._earliest_start(head, overrides)
+                if earliest > head.scheduled_start:
+                    raise SchedulerError(
+                        409,
+                        f"接续后节点预计释放时刻将延至 {extended}，队首作业 "
+                        f"{head.job_id} 即使换机架最早也要 {earliest} 开工，"
+                        f"赶不上已公布的预约 {head.scheduled_start}，拒绝接续；"
+                        "原作业与预约不变",
+                    )
+
+        cont = Job(
+            job_id=self._next_id,
+            nodes=front.nodes,
+            duration=duration,
+            submit_time=self.now,
+            front_id=front.job_id,
+        )
+        # 后段复用前段同组节点（读取节点本地临时文件），受理即锁定机架与节点
+        cont.rack = front.rack
+        cont.assigned_nodes = sorted(front.assigned_nodes)
+        self._next_id += 1
+        self.jobs[cont.job_id] = cont
+        front.continuation_id = cont.job_id
+        events = [self._log(
+            "continuation_accepted",
+            f"受理接续后段 {cont.job_id}：前段 {front.job_id} 完工后在机架 "
+            f"{front.rack} 节点 {cont.assigned_nodes} 接续运行，时限 {duration}；"
+            f"这些节点预计释放时刻计入后段时限，延至 {extended}",
+            cont.job_id, front.rack,
+        )]
+        # 受理后这些节点的预计释放时刻已变化，重排以刷新预约视图
+        events.extend(self.reschedule())
+        return front, cont, events
+
+    def _handoff(self, front: Job, at: int) -> list[Event]:
+        """前段完工交接：后段在当前模拟时刻用同一组节点开工。"""
+        cont = self.jobs[front.continuation_id]  # type: ignore[index]
+        assert cont.status == "queued"
+        rack = front.rack
+        assert rack is not None
+        owner_map = self.owners[rack]
+        front.status = "finished"
+        front.finish_time = at
+        front.finish_reason = "completed"
+        events = [self._log(
+            "job_completed",
+            f"作业 {front.job_id} 于时刻 {at} 完工，机架 {rack} 节点 "
+            f"{front.assigned_nodes} 直接交接给接续后段 {cont.job_id}",
+            front.job_id, rack,
+        )]
+        # 节点归属过户：前段 -> 后段（带归属校验，只过户仍属前段的节点）
+        for n in front.assigned_nodes:
+            if owner_map.get(n) == front.job_id:
+                owner_map[n] = cont.job_id
+        cont.status = "running"
+        cont.actual_start = self.now
+        heapq.heappush(
+            self._timeout_heap,
+            (self.now + cont.duration, next(self._seq), cont.job_id),
+        )
+        events.append(self._log(
+            "job_started",
+            f"接续后段 {cont.job_id} 于当前时刻 {self.now} 在机架 {rack} 节点 "
+            f"{cont.assigned_nodes} 开工（承接前段 {front.job_id}），"
+            f"时限 {cont.duration}，预计释放时刻 {self.now + cont.duration}",
+            cont.job_id, rack,
+        ))
+        return events
+
     # ------------------------------------------------------------- 完工/超时释放
 
     def _release(self, job: Job, reason: Literal["completed", "killed"],
-                 at: int) -> Event:
+                 at: int) -> list[Event]:
         assert job.status == "running"
         rack = job.rack
         assert rack is not None
@@ -288,12 +432,26 @@ class Scheduler:
         job.finish_reason = reason
         etype = "job_completed" if reason == "completed" else "job_timeout"
         label = "完工释放" if reason == "completed" else "达到时限被杀并释放"
-        return self._log(
+        events = [self._log(
             etype,
             f"作业 {job.job_id} 于时刻 {at} {label}机架 {rack} 节点 "
             f"{job.assigned_nodes}",
             job.job_id, rack,
-        )
+        )]
+        # 前段超时：已受理但未开工的接续后段随之取消
+        if reason == "killed" and job.continuation_id is not None:
+            cont = self.jobs[job.continuation_id]
+            if cont.status == "queued":
+                cont.status = "cancelled"
+                cont.finish_time = at
+                cont.finish_reason = "cancelled"
+                events.append(self._log(
+                    "continuation_cancelled",
+                    f"前段 {job.job_id} 超时被杀，接续后段 {cont.job_id} "
+                    "取消（节点本地临时文件随前段一并清理）",
+                    cont.job_id, rack,
+                ))
+        return events
 
     def report_completion(self, job_id: int, at: int) -> tuple[Job, list[Event]]:
         """处理完工回报。
@@ -323,7 +481,12 @@ class Scheduler:
                 f"完工时刻 {at} 已超过运行时限 "
                 f"{job.actual_start + job.duration}，作业应被时限杀掉",
             )
-        events = [self._release(job, "completed", at)]
+        # 前段带已受理的接续后段：完工回报受理后，后段在当前时刻接管节点开工
+        if (job.continuation_id is not None
+                and self.jobs[job.continuation_id].status == "queued"):
+            events = self._handoff(job, at)
+        else:
+            events = self._release(job, "completed", at)
         events.extend(self.reschedule())
         return job, events
 
@@ -349,7 +512,7 @@ class Scheduler:
                     continue
                 if job.actual_start + job.duration != t:
                     continue
-                events.append(self._release(job, "killed", t))
+                events.extend(self._release(job, "killed", t))
             # 每个释放时刻都立即重排，回填作业可能在该时刻入场
             events.extend(self.reschedule())
         return events
@@ -394,6 +557,14 @@ class Scheduler:
                     "deadline": job.scheduled_start + job.duration,
                 })
         return out
+
+    def chained_continuations(self) -> list[Job]:
+        """已受理、等待前段完工的接续后段（按 id 排序）。"""
+        return sorted(
+            (j for j in self.jobs.values()
+             if j.front_id is not None and j.status == "queued"),
+            key=lambda j: j.job_id,
+        )
 
     def rack_occupancy(self) -> list[dict]:
         result = []

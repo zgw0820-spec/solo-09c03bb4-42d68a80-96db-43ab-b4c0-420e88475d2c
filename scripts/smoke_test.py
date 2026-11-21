@@ -128,6 +128,85 @@ def main() -> int:
           new_after["status"] == "running"
           and len(new_after["assigned_nodes"]) == 2, str(new_after))
 
+    print("\n-- 7. 接续：受理计入释放时刻、完工交接、查询两段状态 --")
+    call("POST", "/simulation/reset")
+    _, front = call("POST", "/jobs/submit", {"nodes": 4, "duration": 10})
+    call("POST", "/jobs/submit", {"nodes": 4, "duration": 99})   # 占满 r2
+    status, cont_body = call("POST", f"/jobs/{front['job_id']}/continuation",
+                             {"duration": 5})
+    cont = cont_body["continuation"]
+    check("接续受理：后段排队、锁定前段同组节点",
+          status == 201 and cont["status"] == "queued"
+          and cont["front_id"] == front["job_id"]
+          and cont["assigned_nodes"] == [0, 1, 2, 3], str(cont_body))
+    _, st = call("GET", "/simulation/status")
+    check("状态接口列出待开工后段",
+          [j["job_id"] for j in st["chained_jobs"]] == [cont["job_id"]],
+          str(st["chained_jobs"]))
+    _, head = call("POST", "/jobs/submit", {"nodes": 4, "duration": 4})
+    check("新队首预约计入后段时限（10+5=15）",
+          head["scheduled_start"] == 15, str(head))
+    call("POST", "/simulation/advance", {"steps": 3})
+    status, comp = call("POST", f"/jobs/{front['job_id']}/completion", {"at": 3})
+    check("前段完工回报受理", status == 200, str(comp))
+    _, front_after = call("GET", f"/jobs/{front['job_id']}")
+    _, cont_after = call("GET", f"/jobs/{cont['job_id']}")
+    check("前段完工、后段在当前时刻 t=3 交接开工",
+          front_after["status"] == "finished"
+          and cont_after["status"] == "running"
+          and cont_after["actual_start"] == 3,
+          f"{front_after['status']}/{cont_after['status']}")
+    _, occ = call("GET", "/racks/occupancy")
+    check("r1 节点占用过户给后段",
+          set(occ[0]["nodes"].values()) == {cont["job_id"]}, str(occ[0]))
+    _, head_after = call("GET", f"/jobs/{head['job_id']}")
+    check("队首预约提前到后段释放时刻 t=8",
+          head_after["scheduled_start"] == 8, str(head_after))
+
+    print("\n-- 8. 接续：前段超时取消后段 --")
+    call("POST", "/simulation/reset")
+    call("POST", "/jobs/submit", {"nodes": 4, "duration": 99})   # 占满 r1
+    _, front2 = call("POST", "/jobs/submit", {"nodes": 4, "duration": 3})
+    _, cont2 = call("POST", f"/jobs/{front2['job_id']}/continuation",
+                    {"duration": 5})
+    cid2 = cont2["continuation"]["job_id"]
+    _, head2 = call("POST", "/jobs/submit", {"nodes": 2, "duration": 4})
+    check("队首预约按两段跑满估算（3+5=8）",
+          head2["scheduled_start"] == 8, str(head2))
+    _, adv = call("POST", "/simulation/advance", {"steps": 3})
+    kinds = [e["type"] for e in adv["events"]]
+    check("前段超时事件与后段取消事件出现",
+          "job_timeout" in kinds and "continuation_cancelled" in kinds,
+          str(kinds))
+    _, cont2_after = call("GET", f"/jobs/{cid2}")
+    _, head2_after = call("GET", f"/jobs/{head2['job_id']}")
+    check("后段被取消、队首在释放时刻 t=3 开工",
+          cont2_after["status"] == "cancelled"
+          and head2_after["status"] == "running"
+          and head2_after["actual_start"] == 3,
+          f"{cont2_after['status']}/{head2_after['status']}")
+
+    print("\n-- 9. 接续：预约冲突拒绝，原作业与预约照旧 --")
+    call("POST", "/simulation/reset")
+    _, g1 = call("POST", "/jobs/submit", {"nodes": 4, "duration": 10})
+    _, g2 = call("POST", "/jobs/submit", {"nodes": 4, "duration": 10})
+    _, g3 = call("POST", "/jobs/submit", {"nodes": 4, "duration": 10})
+    check("队首 g3 预约 t=10", g3["scheduled_start"] == 10, str(g3))
+    status, _ = call("POST", f"/jobs/{g1['job_id']}/continuation",
+                     {"duration": 1})
+    check("g1 接续受理（队首可换 r2 赶上 t=10）", status == 201)
+    status, body = call("POST", f"/jobs/{g2['job_id']}/continuation",
+                        {"duration": 1})
+    check("g2 接续被 409 拒绝（两机架都赶不上已公布预约）",
+          status == 409, str(body))
+    _, g2_after = call("GET", f"/jobs/{g2['job_id']}")
+    _, reservations = call("GET", "/reservations")
+    check("原作业与预约照旧",
+          g2_after["status"] == "running"
+          and g2_after["continuation_id"] is None
+          and reservations[0]["scheduled_start"] == 10,
+          f"{g2_after['status']}/{reservations}")
+
     print(f"\n== 结果：{PASS} 通过，{FAIL} 失败 ==")
     return 1 if FAIL else 0
 

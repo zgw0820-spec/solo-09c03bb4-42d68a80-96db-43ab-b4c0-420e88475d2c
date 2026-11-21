@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-JobStatus = Literal["queued", "running", "finished", "killed"]
+JobStatus = Literal["queued", "running", "finished", "killed", "cancelled"]
 
 
 class JobSubmitRequest(BaseModel):
@@ -37,8 +37,34 @@ class JobView(BaseModel):
     )
     finish_reason: str | None = Field(
         default=None,
-        description="completed（完工回报）/ killed（达到时限被杀）",
+        description="completed（完工回报）/ killed（达到时限被杀）/ "
+                    "cancelled（前段超时，接续后段被取消）",
     )
+    front_id: int | None = Field(
+        default=None, description="接续后段指向其前段作业 id"
+    )
+    continuation_id: int | None = Field(
+        default=None, description="前段作业指向其已受理的接续后段 id"
+    )
+
+
+class ContinuationRequest(BaseModel):
+    """为运行中的普通作业提交接续后段（MPI 后处理复用同组节点）。
+
+    - ``duration``: 后段运行时限（模拟时钟单位，必须为正整数）。
+    - 受理前按两段都跑满时限估算原节点释放时刻；若队首即使换机架也
+      赶不上已公布的预约时刻，拒绝接续（409），原作业与预约不变。
+    - 每个前段最多接一段；后段本身不能再挂接续。
+    """
+
+    duration: int = Field(gt=0, description="后段运行时限（模拟时钟单位）")
+
+
+class ContinuationResult(BaseModel):
+    accepted: bool
+    front: JobView
+    continuation: JobView
+    events: list["EventView"]
 
 
 class CompletionRequest(BaseModel):
@@ -71,6 +97,10 @@ class ClusterStatus(BaseModel):
     racks: list[RackOccupancy]
     running_jobs: list[JobView]
     queued_jobs: list[JobView]
+    chained_jobs: list[JobView] = Field(
+        default_factory=list,
+        description="已受理、等待前段完工的接续后段",
+    )
     recent_events: list["EventView"]
 
 
@@ -105,3 +135,4 @@ class CompletionResult(BaseModel):
 
 
 ClusterStatus.model_rebuild()
+ContinuationResult.model_rebuild()
